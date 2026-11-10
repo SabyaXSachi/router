@@ -29,4 +29,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run Rust tests
-        run: cargo test --features cpu,ready
+        run: cargo test --features cpu,ready -- --test-threads=1
