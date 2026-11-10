@@ -3,7 +3,7 @@
 //! Defines the request/response structures for worker management endpoints
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Worker configuration for API requests
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -162,4 +162,39 @@ pub struct ServerInfo {
     pub kv_block_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_attention_block_size: Option<u32>,
+    /// Engine-reported GPU KV cache block count (`num_gpu_blocks` label on
+    /// `vllm:cache_config_info`): the smallest known value across the
+    /// worker's engines. `None` when the worker publishes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_gpu_blocks: Option<u64>,
+    /// Per-engine GPU block count keyed by the `engine` label of
+    /// `vllm:cache_config_info`, assumed to equal the per-process DP-rank
+    /// index. Populated only by the `/metrics` discovery path; empty when
+    /// unknown (static or gRPC discovery).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub num_gpu_blocks_by_engine: BTreeMap<u32, u64>,
+}
+
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_info_without_capacity_fields_deserializes() {
+        let info: ServerInfo = serde_json::from_str(r#"{"kv_block_size": 16}"#).unwrap();
+        assert_eq!(info.kv_block_size, Some(16));
+        assert_eq!(info.num_gpu_blocks, None);
+        assert!(info.num_gpu_blocks_by_engine.is_empty());
+    }
+
+    #[test]
+    fn server_info_capacity_fields_deserialize_per_engine() {
+        let info: ServerInfo = serde_json::from_str(
+            r#"{"num_gpu_blocks": 100, "num_gpu_blocks_by_engine": {"0": 100, "1": 200}}"#,
+        )
+        .unwrap();
+        assert_eq!(info.num_gpu_blocks, Some(100));
+        assert_eq!(info.num_gpu_blocks_by_engine.get(&0), Some(&100));
+        assert_eq!(info.num_gpu_blocks_by_engine.get(&1), Some(&200));
+    }
 }

@@ -1,7 +1,7 @@
 //! Worker discovery: query /get_server_info + /kv_event_sources, spawn one
 //! subscriber per (worker, rank). One indexer per cache-identity core.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +67,11 @@ pub struct WorkerKvInfo {
     /// Cache identity shared by every worker feeding the same placement index.
     /// Absent when discovery cannot create an index for this worker.
     pub cache_key: Option<CacheKey>,
+    /// Engine-reported GPU block capacity per DP rank, when the worker
+    /// publishes it (`num_gpu_blocks` on `vllm:cache_config_info`). A rank the
+    /// engines map does not cover falls back to the smallest known capacity;
+    /// a worker with no capacity data leaves ranks unknown.
+    pub capacity_by_rank: BTreeMap<u32, u64>,
 }
 
 pub(crate) struct WorkerDiscovery {
@@ -88,6 +93,12 @@ struct WorkerSubs {
     ranks: Vec<u32>,
     indexer: Arc<KvBlockIndexer>,
     handles: Vec<SubscriberHandle>,
+    /// Engine-reported GPU block capacity per DP rank (see
+    /// [`WorkerKvInfo::capacity_by_rank`]); empty when unknown.
+    // Written here; read by the PR-1 Stage-2 read-only metrics sampler per the
+    // approved Phase 3G design. Nothing in Stage 1 consumes it yet.
+    #[allow(dead_code)]
+    capacity_by_rank: BTreeMap<u32, u64>,
 }
 
 struct LiveSource {
@@ -332,6 +343,7 @@ impl KvIndexSupervisor {
                     block_size,
                     ranks: vec![],
                     cache_key: None,
+                    capacity_by_rank: BTreeMap::new(),
                 });
             }
         };
@@ -347,6 +359,7 @@ impl KvIndexSupervisor {
                 block_size: None,
                 ranks: vec![],
                 cache_key: None,
+                capacity_by_rank: BTreeMap::new(),
             });
         };
         let Some(model_id) = model_id else {
@@ -355,6 +368,7 @@ impl KvIndexSupervisor {
                 block_size: Some(block_size),
                 ranks: vec![],
                 cache_key: None,
+                capacity_by_rank: BTreeMap::new(),
             });
         };
         let key = CacheKey {
@@ -523,6 +537,15 @@ impl KvIndexSupervisor {
             ranks.push(rank);
         }
 
+        let capacity_by_rank =
+            resolve_capacity_by_rank(&server_info.num_gpu_blocks_by_engine, &ranks, worker_url);
+        if !capacity_by_rank.is_empty() {
+            info!(
+                "kv_index {}: engine GPU block capacity per rank {:?}",
+                worker_url, capacity_by_rank
+            );
+        }
+
         workers.insert(
             worker_url.to_string(),
             WorkerSubs {
@@ -535,6 +558,7 @@ impl KvIndexSupervisor {
                 ranks: ranks.clone(),
                 indexer,
                 handles,
+                capacity_by_rank: capacity_by_rank.clone(),
             },
         );
         self.check_block_size(worker_url, Some(block_size));
@@ -543,6 +567,7 @@ impl KvIndexSupervisor {
             block_size: Some(block_size),
             ranks,
             cache_key: Some(key),
+            capacity_by_rank,
         })
     }
 
@@ -1042,10 +1067,25 @@ async fn query_metrics_metadata(
         );
     }
     let model_id = query_served_model_id(client, worker_url, api_key).await;
+    let num_gpu_blocks_by_engine: BTreeMap<u32, u64> = engines
+        .iter()
+        .filter_map(|(engine, config)| config.num_gpu_blocks.map(|blocks| (*engine, blocks)))
+        .collect();
+    let capacities: BTreeSet<u64> = num_gpu_blocks_by_engine.values().copied().collect();
+    if capacities.len() > 1 {
+        warn!(
+            "kv_index {}: engines disagree on num_gpu_blocks {capacities:?} — keeping per-engine values",
+            worker_url
+        );
+    }
     Ok(ServerInfo {
         model_id,
         kv_block_size: first.block_size,
         effective_attention_block_size: first.effective_attention_block_size,
+        // The smallest known engine capacity: conservative for consumers that
+        // need one scalar, while per-engine values stay available.
+        num_gpu_blocks: num_gpu_blocks_by_engine.values().copied().min(),
+        num_gpu_blocks_by_engine,
         ..Default::default()
     })
 }
@@ -1147,6 +1187,32 @@ fn worker_host(worker_url: &str) -> Option<String> {
         .map(|h| h.to_string())
 }
 
+/// Resolve per-rank engine capacity for a registration. Engine labels on
+/// `vllm:cache_config_info` are assumed to equal the per-process DP-rank
+/// index; a rank the engines map does not cover falls back to the smallest
+/// known capacity (conservative) with a warning. Ranks stay unknown — never
+/// zero — when the worker publishes no capacity at all.
+fn resolve_capacity_by_rank(
+    engines: &BTreeMap<u32, u64>,
+    ranks: &[u32],
+    worker_url: &str,
+) -> BTreeMap<u32, u64> {
+    let fallback = engines.values().copied().min();
+    let mut capacity = BTreeMap::new();
+    for rank in ranks {
+        if let Some(blocks) = engines.get(rank) {
+            capacity.insert(*rank, *blocks);
+        } else if let Some(blocks) = fallback {
+            warn!(
+                "kv_index {}: no engine capacity published for rank {rank} — falling back to smallest known ({blocks})",
+                worker_url
+            );
+            capacity.insert(*rank, blocks);
+        }
+    }
+    capacity
+}
+
 fn discovered_block_size(server_info: &ServerInfo) -> Option<u32> {
     server_info
         .kv_block_size
@@ -1186,6 +1252,9 @@ mod metrics_meta {
         pub(crate) hash_block_size: Option<u32>,
         /// Engine-declared cache layout, once vLLM populates it.
         pub(crate) kv_cache_layout: Option<String>,
+        /// Engine-reported GPU KV cache block count. Missing, empty, zero,
+        /// negative, and non-numeric labels are all unknown.
+        pub(crate) num_gpu_blocks: Option<u64>,
     }
 
     impl EngineCacheConfig {
@@ -1233,6 +1302,7 @@ mod metrics_meta {
             entry.effective_attention_block_size =
                 positive(labels.get("effective_attention_block_size"));
             entry.hash_block_size = positive(labels.get("hash_block_size"));
+            entry.num_gpu_blocks = positive_u64(labels.get("num_gpu_blocks"));
             entry.kv_cache_layout = labels
                 .get("kv_cache_layout")
                 .filter(|layout| !is_unset(layout))
@@ -1244,6 +1314,14 @@ mod metrics_meta {
     fn positive(value: Option<&String>) -> Option<u32> {
         let value = value?;
         value.parse::<u32>().ok().filter(|size| *size > 0)
+    }
+
+    /// Like `positive` for engine-reported block counts: missing, empty,
+    /// zero, negative, and non-numeric labels are all unknown. Large values
+    /// parse losslessly into `u64`.
+    fn positive_u64(value: Option<&String>) -> Option<u64> {
+        let value = value?;
+        value.parse::<u64>().ok().filter(|blocks| *blocks > 0)
     }
 
     /// vLLM serializes an unset `CacheConfig` field as the string `None`.
@@ -1321,6 +1399,55 @@ vllm:cache_config_info{block_size="32",engine="1"} 1.0
                 parse_cache_config_info("vllm:num_requests_running{engine=\"0\"} 1\n").is_empty()
             );
             assert!(parse_cache_config_info("").is_empty());
+        }
+
+        #[test]
+        fn parses_num_gpu_blocks() {
+            let engines = parse_cache_config_info(METRICS);
+            assert_eq!(engines[&0].num_gpu_blocks, Some(12989));
+        }
+
+        #[test]
+        fn missing_num_gpu_blocks_is_unknown() {
+            let metrics = r#"vllm:cache_config_info{block_size="16",engine="0"} 1.0"#;
+
+            assert_eq!(parse_cache_config_info(metrics)[&0].num_gpu_blocks, None);
+        }
+
+        #[test]
+        fn num_gpu_blocks_invalid_values_are_unknown() {
+            for value in ["None", "", "0", "-5", "12x", "16.5"] {
+                let metrics = format!(
+                    "vllm:cache_config_info{{num_gpu_blocks=\"{value}\",engine=\"0\"}} 1.0"
+                );
+                assert_eq!(
+                    parse_cache_config_info(&metrics)[&0].num_gpu_blocks,
+                    None,
+                    "value {value:?} must be unknown"
+                );
+            }
+        }
+
+        #[test]
+        fn num_gpu_blocks_huge_values_parse() {
+            let metrics = r#"
+vllm:cache_config_info{num_gpu_blocks="18446744073709551615",engine="0"} 1.0
+"#;
+            assert_eq!(
+                parse_cache_config_info(metrics)[&0].num_gpu_blocks,
+                Some(u64::MAX)
+            );
+        }
+
+        #[test]
+        fn num_gpu_blocks_kept_per_engine() {
+            let metrics = r#"
+vllm:cache_config_info{num_gpu_blocks="100",engine="0"} 1.0
+vllm:cache_config_info{num_gpu_blocks="200",engine="1"} 1.0
+"#;
+            let engines = parse_cache_config_info(metrics);
+            assert_eq!(engines[&0].num_gpu_blocks, Some(100));
+            assert_eq!(engines[&1].num_gpu_blocks, Some(200));
         }
     }
 }
@@ -3139,6 +3266,131 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
         assert!(error.contains("get_server_info"), "{error}");
         assert!(error.contains("server_info"), "{error}");
         assert!(error.contains("metrics"), "{error}");
+        server.abort();
+    }
+
+    #[test]
+    fn capacity_maps_per_rank_when_engines_cover_them() {
+        let engines = BTreeMap::from([(0, 100u64), (1, 200)]);
+        let capacity = resolve_capacity_by_rank(&engines, &[0, 1], "http://w");
+        assert_eq!(capacity, BTreeMap::from([(0, 100), (1, 200)]));
+    }
+
+    #[test]
+    fn unmapped_ranks_fall_back_to_smallest_known_capacity() {
+        let engines = BTreeMap::from([(0, 200u64), (3, 100)]);
+        let capacity = resolve_capacity_by_rank(&engines, &[0, 7], "http://w");
+        assert_eq!(capacity, BTreeMap::from([(0, 200), (7, 100)]));
+    }
+
+    #[test]
+    fn ranks_without_any_engine_capacity_stay_unknown() {
+        let capacity = resolve_capacity_by_rank(&BTreeMap::new(), &[0], "http://w");
+        assert!(capacity.is_empty());
+    }
+
+    /// A worker whose engine publishes `num_gpu_blocks` on `vllm:cache_config_info`.
+    const METRICS_WITH_CAPACITY: &str = "\
+# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",num_gpu_blocks=\"12989\",engine=\"0\"} 1.0
+";
+
+    fn metrics_text_router(metrics: &'static str) -> axum::Router {
+        use axum::{routing::get, Router};
+
+        Router::new()
+            .route("/metrics", get(move || async move { metrics }))
+            .route(
+                "/v1/models",
+                get(|| async { axum::Json(serde_json::json!({"data": [{"id": "mock-model"}]})) }),
+            )
+    }
+
+    #[tokio::test]
+    async fn metrics_capacity_flows_into_server_info() {
+        let (worker, server) =
+            spawn_metrics_only_worker(metrics_text_router(METRICS_WITH_CAPACITY)).await;
+
+        let info = query_worker_metadata(&reqwest::Client::new(), &worker, None)
+            .await
+            .unwrap();
+        assert_eq!(info.kv_block_size, Some(16));
+        assert_eq!(info.num_gpu_blocks, Some(12989));
+        assert_eq!(info.num_gpu_blocks_by_engine.get(&0), Some(&12989));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn disagreeing_engine_capacities_keep_per_rank_values() {
+        let metrics = "\
+# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size=\"16\",num_gpu_blocks=\"100\",engine=\"0\"} 1.0
+vllm:cache_config_info{block_size=\"16\",num_gpu_blocks=\"200\",engine=\"1\"} 1.0
+";
+        let (worker, server) = spawn_metrics_only_worker(metrics_text_router(metrics)).await;
+
+        let info = query_worker_metadata(&reqwest::Client::new(), &worker, None)
+            .await
+            .unwrap();
+        // The scalar is the smallest known value; per-engine values survive.
+        assert_eq!(info.num_gpu_blocks, Some(100));
+        assert_eq!(info.num_gpu_blocks_by_engine.get(&0), Some(&100));
+        assert_eq!(info.num_gpu_blocks_by_engine.get(&1), Some(&200));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn worker_capacity_flows_through_install() {
+        use axum::routing::get;
+
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let sources = serde_json::json!({
+            "0": {
+                "endpoint": endpoint,
+                "topic": "kv/capacity-0",
+                "publisher": "zmq",
+                "encoding": "msgpack",
+                "schema_version": 1,
+                "enable_kv_cache_events": true
+            },
+            "1": {
+                "endpoint": endpoint,
+                "topic": "kv/capacity-1",
+                "publisher": "zmq",
+                "encoding": "msgpack",
+                "schema_version": 1,
+                "enable_kv_cache_events": true
+            }
+        });
+        let router = metrics_text_router(METRICS_WITH_CAPACITY).route(
+            "/kv_event_sources",
+            get(move || {
+                let sources = sources.clone();
+                async move { axum::Json(sources) }
+            }),
+        );
+        let (worker, server) = spawn_metrics_only_worker(router).await;
+
+        let (supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert_eq!(info.block_size, Some(16));
+        assert!(
+            info.cache_key.is_some(),
+            "metadata should produce a cache identity"
+        );
+        // Rank 1 publishes no engine series, so it falls back to the smallest
+        // known capacity instead of staying unknown or becoming zero.
+        assert_eq!(
+            info.capacity_by_rank,
+            BTreeMap::from([(0, 12989), (1, 12989)])
+        );
+        supervisor.shutdown();
         server.abort();
     }
 }
