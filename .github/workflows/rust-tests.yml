@@ -1,0 +1,32 @@
+name: Rust tests
+
+on:
+  push:
+    branches: [feat/kv-index-observability]
+  pull_request:
+    branches: [main, "release-**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    name: Rust tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust tests
+        run: cargo test --features cpu,ready
